@@ -1,0 +1,1043 @@
+---
+title: "Suns Project #2 Code & Notes"
+author: "Joe Siwinski"
+date: "9/11/2020"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, error = FALSE, warning = FALSE, fig.align = "center", message = FALSE)
+```
+
+---
+
+# Introduction
+
+The goal of this project is to predict win totals and probability of making the playoffs for any team prior to the start of the season. In addition, we want to find out the impact on playoff probabilty for teams when their is a play-in series. I took the following approach to complete the project. These steps are expanded on in the sections that follow.
+
+<br/>
+
+<center>
+
+*Outline of my steps to complete the project*
+
+</center>
+
+<br/>
+
+1) Model #1 - Game Score Differential Model
+
+
+2) Model #2 - Game Win Prob Model (Based on Predicted Score Differenctial)
+
+
+3) Simulate 10,000 seasons on a "fake" 82 game traditional schedule to estimate average end of season win totals and playoff probability
+
+
+4) Simulate a play-in series for seasons from 10,000 sims that meet the play-in criteria and compare playoff probabilities of play-in seasons to traditional seasons in step #3.
+
+<br/>
+
+---
+
+## 1 - Score Differential Model
+
+I will first train a model on each game in the past 5 seasons (2014-15 to 2018-19 Season) to come up with an expected score differential between two teams that are playing. Since we are working strictly on predictions made prior to the season starting, we cannot use any performance metrics that the team has (Net Rating, Offensive Net Rating, etc.). In other words, I am confined to using roster variables (Amount of stars on the team, Career Win Share avg. of team, etc.) and location of game (Home/Away) to predict this score differential. To keep things simple, I will train this model within relation to the home team only. The resulting underlying model function is shown below.
+
+
+<br/>
+
+<center>
+
+$$\text{Home Team Score Diff}  =  \beta{0}+ \beta1*{\text{Roster OWS Diff.}} + \beta2*{\text{Roster DWS Diff.}} +  \beta3*{\text{Roster All-NBA Diff.}} + \epsilon $$
+
+</center>
+
+<br/>
+
+I will gather data for each team for the 2014-15 to 2018-19 NBA seasons to train this model. For Win Share values, I will use each players' previous 2 season Win Share averages. For All NBA, I will utilize the past seasons All-NBA selections. This data gather is shown in the code chunk below.
+
+```{r, eval=FALSE, echo=TRUE}
+
+# Load packages
+library(tidyverse)
+library(ggplot2)
+library(glue)
+library(scales)
+library(plotly)
+library(shiny)
+library(readxl)
+
+########## NEED DATA FOR TRAINING ###########
+
+# Read in game roster data 
+game_rosters <- read_rds("../SunsProject/game_data.rds")
+
+# Read in All NBA team selections
+all_nba <- read_rds("../SunsProject/all_nba_selections.rds")
+
+# Read in game results data
+game_results <- read_rds("../SunsProject/game_results.rds")
+
+library(ballr)
+
+# Trying to get season stats from past two seasons for each season start
+fetch_winshares <- function(x){
+  
+  # Getting Per game OWS DWS
+  test <- NBAPerGameAdvStatistics(x) %>% 
+    mutate(tot_mins = g*mp) %>% 
+    select(player, tot_mins, ows, dws)
+  
+  # Adding season 
+  test$season <- x
+  
+  print(x)
+  return(test)
+  
+}
+
+# Loop through to get player win shares for each season since 2012-13
+win_shares <- lapply(c(2013:2020), fetch_winshares)
+win_shares <- do.call(rbind, win_shares)
+
+# Getting TOT rows for traded players
+win_shares <- win_shares %>% 
+  group_by(player, season) %>% 
+  filter(tot_mins == max(tot_mins))
+
+# Getting previous 2 season weighted average win shares for each season
+library(zoo)
+win_shares <- win_shares %>% group_by(player) %>% arrange(desc(season)) %>%
+  mutate(tot_mins_sum = rollsum(tot_mins, k = 2, fill = dplyr::lead(tot_mins)),
+         
+         
+         # Getting OWS/DWS * tot_mins for each season
+         ows_mins = ows*tot_mins, 
+         dws_mins = dws*tot_mins,
+         
+         # Getting OWS/DWS * tot_mins sum for past two seasons
+         ows_sum = rollsum(ows_mins, k = 2, fill =  dplyr::lead(ows_mins)), 
+         dws_sum = rollsum(dws_mins, k = 2, fill =  dplyr::lead(dws_mins)), 
+         
+         # Divide OWS/DWS sums by tot_mins_sum column to get weighted average
+         ows_wa = ows_sum/tot_mins_sum, 
+         dws_wa = dws_sum/tot_mins_sum) %>% 
+  
+  # Getting vars needed
+  select(player, season, ows_wa, dws_wa, tot_mins = tot_mins_sum) %>% 
+  mutate(season = season + 1) %>% 
+  
+  ungroup()
+
+
+# Putting in 25th percentile avg. win shares for rookies
+ows_missing <- quantile(win_shares$ows_wa, na.rm = TRUE, probs = 0.25) %>% 
+  as.numeric()
+dws_missing <- quantile(win_shares$dws_wa, na.rm = TRUE, probs = 0.25) %>% 
+  as.numeric()
+
+win_shares <- win_shares %>% mutate(ows_wa = ifelse(is.na(ows_wa) == TRUE, ows_missing, ows_wa), 
+                      dws_wa = ifelse(is.na(dws_wa) == TRUE, dws_missing, dws_wa))
+
+
+
+# Getting rid of accents in player names
+rm_accent <- function(str,pattern="all") {
+   if(!is.character(str))
+    str <- as.character(str)
+
+  pattern <- unique(pattern)
+
+  if(any(pattern=="Ç"))
+    pattern[pattern=="Ç"] <- "ç"
+
+  symbols <- c(
+    acute = "áéíóúÁÉÍÓÚýÝ",
+    grave = "àèìòùÀÈÌÒÙ",
+    circunflex = "âêîôûÂÊÎÔÛ",
+    tilde = "ãõÃÕñÑ",
+    umlaut = "äëïöüÄËÏÖÜÿ",
+    cedil = "çÇćčşšŽžūİŠāŠ"
+  )
+
+  nudeSymbols <- c(
+    acute = "aeiouAEIOUyY",
+    grave = "aeiouAEIOU",
+    circunflex = "aeiouAEIOU",
+    tilde = "aoAOnN",
+    umlaut = "aeiouAEIOUy",
+    cedil = "cCccssZzuISaS"
+  )
+
+  accentTypes <- c("´","`","^","~","¨","ç")
+
+  if(any(c("all","al","a","todos","t","to","tod","todo")%in%pattern)) # opcao retirar todos
+    return(chartr(paste(symbols, collapse=""), paste(nudeSymbols, collapse=""), str))
+
+  for(i in which(accentTypes%in%pattern))
+    str <- chartr(symbols[i],nudeSymbols[i], str) 
+
+  return(str)
+}
+
+# Joining the 2 year avg. dws ows to the game_rosters df
+game_rosters2 <- game_rosters %>% 
+  
+  
+  # Joining all - NBA Selection players
+  left_join(all_nba %>% dplyr::select(player, season, AllNBA)) %>%
+  
+  # Getting rid of Jr. and Sr. 
+  mutate(player = str_remove_all(player, '\\ Jr.'), 
+         player = str_remove_all(player, '\\ Sr.')) %>%
+  
+  left_join(win_shares %>%
+  ungroup() %>%
+  mutate(player = str_replace(player, '\\*', ''), 
+         player = str_remove_all(player, '\\.'), 
+         player = str_remove_all(player, '\\ Jr'), 
+         player = str_remove_all(player, '\\ Sr'), 
+         player = trimws(player)) %>%
+  mutate(player = rm_accent(player)), by = c("player" = "player", "season" = "season")) %>% 
+  filter(is.na(dws_wa) == FALSE) 
+
+### GO BACK TO THIS TO ADJUST ROOKS
+
+
+# Setting up model dataframe 
+# Need dws, ows, amount of ALL NBA for each team game
+team_ws_game <- game_rosters2 %>% filter(min > 0) %>% 
+  filter(grepl('Regular Season', dataset)) %>%
+  select(season, gameid, date, player, own_team, opp_team, venue, ows_wa, dws_wa, AllNBA) %>% 
+  
+  #Getting sum of ows_wa
+  group_by(gameid, season, date, own_team, opp_team, venue) %>%
+  summarise(tot_ows = sum(ows_wa), 
+            tot_dws = sum(dws_wa), 
+            tot_all_nba = sum(AllNBA, na.rm = TRUE)) 
+
+
+# Each game has one row in order to obtain differences in each stat with respect to home team
+home_team_games <- team_ws_game %>% 
+  ungroup() %>%
+  dplyr::rename(home_ows = tot_ows, home_dws = tot_dws, home_all_nba = tot_all_nba) %>%
+  filter(venue == "H") %>% 
+  left_join(team_ws_game %>% ungroup() %>% filter(venue == "R") %>% dplyr::select(gameid, season, away_team = own_team,
+                                                             away_ows = tot_ows, away_dws = tot_dws, away_all_nba = tot_all_nba), 
+            by = c("gameid", "season", "opp_team" = "away_team")) %>% 
+  
+  # Join game scores 
+  left_join(game_results %>% 
+              select(gameid, home_final_score, away_final_score = road_final_score, season), 
+            by = c("gameid", "season")) %>% 
+  
+  
+  mutate(ows_diff = home_ows - away_ows, 
+         dws_diff = home_dws - away_dws, 
+         all_nba_diff = home_all_nba - away_all_nba, 
+         score_diff = home_final_score - away_final_score) %>% 
+  
+  select(gameid, season, ows_diff:score_diff)
+
+
+### MODEL DF NOW READY - home_team_games ##
+
+write_rds(home_team_games, "winprob_model_data.rds")
+
+```
+
+---
+
+### Variable Relationships
+
+Once I collect the data into one condense data frame, I am now ready to create my first model that predicts the *score differential* with respect to the home team. We can first explore the three variables and their relationships with the dependent variable (Score Differential) in the plots below:
+
+
+```{r, fig.align='center', fig.height=8, echo=TRUE}
+# Packages
+library(tidyverse)
+library(glue)
+library(ggplot2)
+library(ggpubr)
+
+
+# Read in data
+home_team_games <- read_rds("../SunsProject/winprob_model_data.rds") 
+
+
+### Variable exploration ###
+
+# Plot maker function
+plot_maker <- function(stat_selected = c("ows_diff", "dws_diff", "all_nba_diff"), title_selected) {
+  
+  
+  p <- home_team_games %>%
+  ggplot(aes(x = home_team_games[[stat_selected]], y = score_diff)) + 
+  geom_point() + 
+  geom_smooth(method = "glm") + 
+  stat_cor() + 
+  
+    
+  # Theme stuff
+  theme_classic() + 
+  ggtitle(glue("{title_selected}")) + 
+  xlab(glue("{title_selected}")) + 
+  ylab("Score Differential") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+  
+}
+
+#Running function for each stat diff.
+p1 <- plot_maker("ows_diff", "OWS Diff.")
+p2 <- plot_maker("dws_diff", "DWS Diff.")
+p3 <- plot_maker("all_nba_diff", "All-NBA Diff.")
+
+
+# Output to Rmd grid.arrange
+gridExtra::grid.arrange(p1,p2,p3)
+
+write_rds(p1, "~/Documents/Bookdown Project 2021/p1.rds")
+write_rds(p2, "~/Documents/Bookdown Project 2021/p2.rds")
+write_rds(p3, "~/Documents/Bookdown Project 2021/p3.rds")
+
+```
+
+
+---
+
+### Score Difference Model Training
+
+We have encouraging variable correlations as shown in the previous plots. Now it is time to train a model to predict score differential of games. I am going to train a model using `cv.glmnet` from the `glmnet` package in R. Again, this model is trained on the following underlying function:
+
+<br/>
+
+<center>
+
+$$\text{Home Team Score Diff}  =  \beta{0}+ \beta1*{\text{Roster OWS Diff.}} + \beta2*{\text{Roster DWS Diff.}} +  \beta3*{\text{Roster All-NBA Diff.}} + \epsilon $$
+
+</center>
+
+<br/>
+
+
+```{r, echo=TRUE, eval=FALSE}
+
+# Data to be used here is again home_team_games.rds
+
+#############################
+###### MODEL TRAINING #######
+#############################
+
+# Packages
+library(tidyverse)
+library(broom)
+library(glmnet)
+library(coefplot)
+
+# Output vars
+y <- home_team_games$score_diff
+x <- home_team_games %>% select(ows_diff, dws_diff, all_nba_diff) %>% 
+  
+  # Scale for interprettable coef estimates
+  # mutate_all(scale) %>%
+  data.matrix()
+
+lambdas <- 10^seq(3, -2, by = -.1)
+
+
+# Tuning for lambda
+cv_fit <- cv.glmnet(x, y, alpha = 0, lambda = lambdas)
+plot(cv_fit)
+
+# Minimized lambda
+opt_lambda <- cv_fit$lambda.min
+opt_lambda
+
+# Fit
+fit <- cv_fit$glmnet.fit
+summary(fit)
+coef(cv_fit, "lambda.min")
+
+# Predict 
+y_predicted <- predict(fit, s = opt_lambda, newx = x)
+
+# Sum of Squares Total and Error
+sst <- sum((y - mean(y))^2)
+sse <- sum((y_predicted - y)^2)
+
+# R squared
+rsq <- 1 - sse / sst
+rsq
+
+
+# Prediction dataframe
+home_team_games_preds <- cbind(home_team_games, y_predicted) %>% 
+  dplyr::rename(pred_score_diff = `1`)
+```
+
+---
+
+## 2 - Win Prob Model
+
+After training a model to predict score differential, we can then train a model that predicts win probability based on the score prediction. To accomplish this, I utlized a logistic glm modeling technique. The formula that the win-prob model is based on is as follows:
+
+<br/>
+
+<center>
+
+$$\text{Win Probability}  =  \beta{0}+ \beta1*{\text{Predicted Score Diff.}} + \epsilon $$
+
+</center>
+
+<br/>
+
+
+```{r, eval=FALSE, echo=TRUE}
+
+# Utilizing created dataframe in previous code chunk - home_team_games_preds
+# Creating a win binary column
+home_team_games_preds <- home_team_games_preds %>% 
+  mutate(win = ifelse(score_diff > 0, 1, 0))
+
+# Model function will be:
+# Prob Winning Game ~ Predicted Score Differential 
+
+# Train/Test Split
+require(caTools)
+set.seed(824) 
+sample_split <- sample.split(home_team_games_preds$win, SplitRatio = .75)
+train = subset(home_team_games_preds, sample_split == TRUE)
+test  = subset(home_team_games_preds, sample_split == FALSE)
+
+# Inputs
+y <- train$win
+x <- train$pred_score_diff
+
+# GLM 
+model_winprob <- glm(win ~ pred_score_diff, family = "binomial", data = home_team_games_preds)
+
+# Predict on both training and test sets
+train <- train %>% mutate(win_prob = predict(model_winprob,., type = "response")) 
+test <- test %>% mutate(win_prob = predict(model_winprob, ., type = "response"))
+
+# LogLoss Evals on both train and test sets
+library(MLmetrics)
+LogLoss(train$win_prob, train$win)
+LogLoss(test$win_prob, test$win)
+            
+```
+
+```{r, echo=FALSE, eval=FALSE}
+# Train Calibration Plot
+train_cal_plot <- train %>% 
+  mutate(win_prob = plyr::round_any(win_prob, 0.1)) %>% 
+  group_by(win_prob) %>% 
+  summarise(tot = n(), 
+            actual_win_perc = mean(win)) %>% 
+  
+  ggplot(aes(x = win_prob, y = actual_win_perc, size = tot, 
+             text = glue("Predicted Win Prob. = {win_prob}
+                         Actual Win Prob. = {round(actual_win_perc,2)}
+                         Total Observations = {tot}"))) + 
+  geom_point() + 
+  geom_abline() + 
+  
+  # Theme stuff
+  theme_classic() +
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5)) + 
+  scale_x_continuous("Predicted Win Probability", limits = c(0,1)) + 
+  scale_y_continuous("Actual Win Probaility", limits = c(0,1)) + 
+  ggtitle("Train Set - Win Prob Calibration Plot")
+
+# Test Calibration Plot
+test_cal_plot <- test %>% 
+  mutate(win_prob = plyr::round_any(win_prob, 0.1)) %>% 
+  group_by(win_prob) %>% 
+  summarise(tot = n(), 
+            actual_win_perc = mean(win)) %>%
+  
+  ggplot(aes(x = win_prob, y = actual_win_perc, size = tot, 
+             text = glue("Predicted Win Prob. = {win_prob}
+                         Actual Win Prob. = {round(actual_win_perc,2)}
+                         Total Observations = {tot}"))) + 
+  geom_point() + 
+  geom_abline() + 
+  
+  # Theme stuff
+  theme_classic() +
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5)) + 
+  scale_x_continuous("Predicted Win Probability", limits = c(0,1)) + 
+  scale_y_continuous("Actual Win Probaility", limits = c(0,1)) + 
+  ggtitle("Test Set - Win Prob Calibration Plot")
+   
+# Write to rds
+write_rds(train_cal_plot, "../SunsProject/train_cal_plot.rds")
+write_rds(test_cal_plot, "../SunsProject/test_cal_plot.rds")
+
+```
+
+To evaluate my win probability model, I also like to create calibration plots as shown below. Here we can see that the model does a good job of predicting game outcomes on both the train data as well as the test dataset.
+
+<center>
+
+*Calibration Plots on Win Prob Predictions*
+
+</center>
+
+```{r, echo=FALSE}
+# Read in cal plot rds
+train_cal_plot <- read_rds("../SunsProject/train_cal_plot.rds")
+test_cal_plot <- read_rds("../SunsProject/test_cal_plot.rds")
+
+# Output to Rmd
+library(shiny)
+library(plotly)
+div(ggplotly(train_cal_plot, tooltip = c("text")), align = "right")
+div(ggplotly(test_cal_plot, tooltip = c("text")), align = "right")
+```
+
+---
+
+## 3 - Simulating Traditional Seasons {.tabset}
+
+With a pre-season game win-prob model in place, we now theoretically know the probability of the home team winning the game in any matchup between two teams. For my simulations, I used a "fake" schedule by using the 2013-14 NBA season (not included in modeling process). Each game has a win probability associated with it. I simulated this "fake" season 10,000 times to obtain both win total average predictions and average playoff probability for each team based on all of the simulation results. 
+
+First, I needed to gather the variable data for this past season (2019-20 Season) in order to make score differential & win probability predictions. In the following chunk, I also create the fake schedule dataframe that I use to simulate multiple seasons.
+
+```{r, eval=FALSE, echo=TRUE}
+
+# Read in starting rosters 2019-20 NBA season
+starting_rosters <- read_excel("../SunsProject/WinProb.xlsx", sheet = "Initial_Rosters") %>% 
+  
+  # Select Columns player, team, injury
+  select(player, team, injury) %>%
+  
+  # Mutate 0s for non injuries
+  mutate(injury = ifelse(is.na(injury) == TRUE, 0, injury), 
+         season = as.numeric(2020), 
+         player = rm_accent(player),
+         player = trimws(player),
+         player = as.character(player)) %>% 
+  
+  # Remove na players
+  na.omit() %>% as.data.frame() %>% 
+  
+  # Remove Blake Griffin Injury
+  filter(!(player %in% c("Blake Griffin")))
+
+# Read in all-NBA from previous season 
+all_nba_twenty <- read_rds("../SunsProject/all_nba_selections.rds") %>% 
+  filter(season == 2020)
+
+## Getting win share averages for players at the start of the 2019-20 NBA season
+team_data_for_sim <- starting_rosters %>% ungroup() %>%
+  left_join(win_shares %>% 
+              ungroup() %>%
+              mutate(player = rm_accent(player), 
+                     player = trimws(player))) %>% 
+  arrange(team) %>% 
+  
+  # Rookie adjustment
+  mutate(ows_wa = ifelse(is.na(ows_wa) == TRUE, ows_missing, ows_wa), 
+         dws_wa = ifelse(is.na(dws_wa) == TRUE, dws_missing, dws_wa)) %>%
+  
+  # Porzingis adjustment
+  mutate(ows_wa = ifelse(player == "Kristaps Porzingis", 2.0570608, ows_wa), 
+         dws_wa = ifelse(player == "Kristaps Porzingis", 1.997118, dws_wa)
+         ) %>% 
+  
+  select(-tot_mins) %>% 
+  
+  # Joining to get all NBA  
+  left_join(all_nba_twenty %>% select(player, season, AllNBA), by = c("player", "season")) %>% 
+  mutate(AllNBA = ifelse(is.na(AllNBA) == TRUE, 0, AllNBA)) %>% 
+  
+
+  # Removing players that have season injuries (KD)
+  filter(injury == 0) %>% 
+  unique() %>%
+  #  
+  # View()
+  # 
+  # Grouping by team and getting sum for ows, dws, AllNBA
+  group_by(team) %>% 
+  summarise(ows = sum(ows_wa, na.rm = TRUE), 
+            dws = sum(dws_wa, na.rm = TRUE), 
+            AllNBA = sum(AllNBA, na.rm = TRUE), 
+            tot = n())
+
+# Abbreviation translator 
+abbreviation <- team_data_for_sim %>% distinct(team) %>% 
+  pull(team)
+team_names <- c("Atlanta", "Brooklyn", "Boston", "Chicago", "Charlotte", "Cleveland", "Dallas", "Denver", "Detroit", 
+                "Golden State", "Houston", "Indiana", "LA Clippers", "LA Lakers", "Memphis", "Miami", "Milwaukee", 
+                "Minnesota", "New Orleans", "New York", "Oklahoma City", "Orlando", "Philadelphia", "Phoenix", "Portland",
+                "Sacramento", "San Antonio", "Toronto", "Utah", "Washington")
+team_translator <- cbind(abbreviation, team_names) %>% as.data.frame()
+
+# Getting team name in team data df
+team_data_for_sim <- team_data_for_sim %>% left_join(team_translator, by = c("team" = "abbreviation")) %>% 
+  select(-team) %>% 
+  select(team = team_names, ows, dws, AllNBA)
+
+# Reading in fake 82-game schedule (2013-14 NBA Schedule)
+sim_schedule <- read_excel("../SunsProject/SimulationSchedule.xlsx") %>% 
+  
+  # Getting only Reg Season
+  dplyr::filter(`DATASET` == "2013-2014 Regular Season") %>%
+  
+  #Getting what I need
+  select(date = DATE, home_team = `HOME TEAM`, away_team = `ROAD TEAM`) %>% 
+  
+  # Joining to get home team team stats
+  left_join(team_data_for_sim %>% 
+              
+              # Rename vars for home
+              dplyr::rename(home_ows = ows, home_dws = dws, home_all_nba = AllNBA), 
+            by = c("home_team" = "team")) %>% 
+  
+  # Joining to get away team team stats
+  left_join(team_data_for_sim %>% 
+              
+              # Rename vars for away
+              dplyr::rename(away_ows = ows, away_dws = dws, away_all_nba = AllNBA), 
+            by = c("away_team" = "team")) %>% 
+  
+  
+  # Getting differentials for model preds.
+  mutate(ows_diff = home_ows - away_ows, 
+         dws_diff = home_dws - away_dws, 
+         all_nba_diff = home_all_nba - away_all_nba) %>% 
+  
+  select(date, home_team, away_team, ows_diff:all_nba_diff)
+  
+  
+################################
+## SIM SCHEDULE NOW COMPLETED ##
+################################
+
+```
+
+Next, I simulate 10,000 seasons in the traditional format (No Play-in). The code to this and the results from the simulations is shown below.
+
+```{r, eval=FALSE, echo=TRUE}
+
+#######################
+### SETTING UP SIMS  ##
+#######################
+
+# West 
+west <- c("Dallas", "Denver",
+                "Golden State", "Houston", "LA Clippers", "LA Lakers", "Memphis",
+                "Minnesota", "New Orleans", "Oklahoma City", "Phoenix", "Portland",
+                "Sacramento", "San Antonio", "Utah")
+
+# East
+east <- c("Atlanta", "Brooklyn", "Boston", "Chicago", "Charlotte", "Cleveland", "Detroit", 
+                "Indiana", "Miami", "Milwaukee", 
+                 "New York", "Orlando", "Philadelphia", "Toronto", "Washington")
+
+
+# Setting up Sim Empty Data frames that will have win total for season and if they make the playoffs
+simulated_west <- data.frame(west) %>% mutate(sim_wins = NA, sim_playoffs = NA)
+simulated_east <- data.frame(east) %>% mutate(sim_wins = NA, sim_playoffs = NA)
+
+# Applying Models to Sim Data for predicted Score Diff. and Win Prob
+sim_model_data <- sim_schedule %>% dplyr::select(ows_diff:all_nba_diff) %>% 
+  # mutate_all(scale) %>% 
+  data.matrix()
+
+sim_preds <- predict(fit, s = cv_fit$lambda.min, newx = sim_model_data) %>% as.data.frame() %>% 
+  dplyr::rename(pred_score_diff = `1`) %>% 
+  mutate(win_prob = predict(model_winprob, ., type = "response"))
+
+# Sim data with preds 
+sim_data_final <- sim_schedule %>% cbind(sim_preds)
+
+# Simulating
+season_simulator <- function(iter) {
+  
+  #To simulate a season, we generate 1230 random numbers between 1 and 0, one for each game of the season
+  sim_random <- runif(1230)
+  
+  # Join to sim_data_final
+  sim_df <- sim_data_final %>% cbind(sim_random) %>% 
+    mutate(sim_win = ifelse(win_prob >= sim_random, 1,0), 
+           sim_season = iter)
+  
+  # Home Wins
+  home_wins <- sim_df %>% group_by(home_team) %>% 
+    summarise(home_wins = sum(sim_win))
+  
+  # Away Wins
+  away_wins <- sim_df %>% group_by(away_team) %>% 
+    filter(sim_win == 0) %>%
+    summarise(away_wins = n())
+  
+  # Total Wins
+  output_df <- home_wins %>% left_join(away_wins, by = c("home_team"="away_team")) %>% 
+    mutate(total_wins = home_wins+away_wins) %>% 
+    dplyr::select(team = home_team, total_wins) %>% 
+    mutate(sim_season = iter)
+  
+  # Progress
+  print(percent(iter/10000))
+
+  
+  # Return Sim_df
+  return(output_df)
+  
+  
+}
+
+# Running on 10,000 simulations
+sims <- lapply(c(1:10000), season_simulator)
+sims <- do.call(rbind, sims) %>%
+  
+  # Getting conference 
+  mutate(conf = ifelse(team %in% west, "West", "East"))
+
+# TRADITIONAL SEASON RESULTS
+# Estimated Win Totals and Playoff Prob without play in
+traditional_results <- sims %>% group_by(sim_season, conf) %>% 
+  arrange(desc(total_wins)) %>% 
+  mutate(playoff_seed = rank(-total_wins, ties.method = "random"), 
+         playoffs = ifelse(playoff_seed <= 8, 1, 0)) %>% 
+  group_by(team, conf) %>%
+  summarise(avg_wins = mean(total_wins, na.rm = TRUE), 
+            playoff_prob = mean(playoffs))
+
+# Write to rds
+write_rds(traditional_results, "../SunsProject/sim_traditional_results.rds")
+```
+
+
+
+### East Sim Results
+
+
+```{r, echo=FALSE}
+library(DT)
+
+# Read in data
+traditional_results <- read_rds("../SunsProject/sim_traditional_results.rds") %>% 
+  mutate(avg_wins = round(avg_wins, 2)) %>%
+  rename(Team = team, Conference = conf, `Avg Wins` = avg_wins, `Playoff Prob.` = playoff_prob) %>% 
+  arrange(desc(`Avg Wins`))
+
+## DATATABLE OUTPUT ##
+
+DT::datatable(traditional_results %>% filter(Conference == "East"), selection = "single",
+                  filter = 'top',
+                  options = list(sDom  = '<"top"><"bottom">', 
+                                  pageLength = 15)) %>% 
+      formatPercentage('Playoff Prob.') %>%
+      formatStyle('Playoff Prob.', background = styleColorBar(traditional_results$`Playoff Prob.`, 'lightblue'))
+
+
+```
+
+---
+
+### West Sim Results
+
+```{r, echo=FALSE}
+library(DT)
+
+# Read in data
+traditional_results <- read_rds("../SunsProject/sim_traditional_results.rds") %>% 
+  mutate(avg_wins = round(avg_wins, 2)) %>%
+  rename(Team = team, Conference = conf, `Avg Wins` = avg_wins, `Playoff Prob.` = playoff_prob) %>% 
+  arrange(desc(`Avg Wins`))
+
+## DATATABLE OUTPUT ##
+
+DT::datatable(traditional_results %>% filter(Conference == "West"), selection = "single",
+                  filter = 'top',
+                  options = list(sDom  = '<"top"><"bottom">', 
+                                  pageLength = 15)) %>% 
+      formatPercentage('Playoff Prob.') %>%
+      formatStyle('Playoff Prob.', background = styleColorBar(traditional_results$`Playoff Prob.`, 'lightblue'))
+
+
+```
+
+
+---
+
+## 4 - Simulating Play-Ins
+
+Finally, I needed to compare playoff probabilities in a traditional season versus that of play-in style seasons. To do this, I simulated a play-in series for the simulated seasons from above that would have resulted in play-in games (Seasons where the 8 and 9 seeds were separated by 2 GB). With the game level win prob model, I simulated a play in series for each of these seasons and recalculated teams' playoff probabilities only now with the results of play-ins included. The code process to do this can be seen below.
+
+<center>
+
+*NOTE: Play in series has 8 seed at home for 1st game. 9 seed at home for 2nd game if necessary.*
+
+</center>
+
+
+```{r, echo=TRUE, eval=FALSE}
+######################
+#### PLAY IN SIMS ####
+######################
+
+
+# Getting sim seasons from section #3 that would have resulted in play in
+play_in_sims <-  sims %>% group_by(sim_season, conf) %>% 
+  mutate(
+    games_behind = max(total_wins) - total_wins,
+    playoff_seed = rank(-total_wins, ties.method = "random")) %>% 
+  arrange(desc(playoff_seed)) %>%
+  mutate(
+    
+    # Flag for if a team is in play-in tourney
+    play_in = ifelse(playoff_seed == 9 & abs(games_behind - dplyr::lead(games_behind)) <= 2, 1, 0)) %>% 
+  
+  mutate(
+    play_in = ifelse(playoff_seed == 8 & sum(play_in) == 1, 1, play_in), 
+    play_in = ifelse(is.na(play_in) == TRUE, 0, play_in)) 
+
+
+# Getting the iter number for these play in seasons
+play_in_seasons <- play_in_sims %>% 
+  filter(play_in == 1) %>% ungroup() %>%
+  distinct(sim_season) %>% pull(sim_season)
+
+
+# Sim function to play out play ins
+# x = sim season iter number
+play_the_play_in <- function(x){
+  
+  # x <- 1
+  
+  # Filtering the sim season iter
+play_in_sims <- sims %>% group_by(sim_season, conf) %>% 
+  
+  # Games behind and playoff seed
+  mutate(
+    games_behind = max(total_wins) - total_wins,
+    playoff_seed = rank(-total_wins, ties.method = "random")) %>% 
+  arrange(desc(playoff_seed)) %>%
+  
+  # Flag for if team is in play in
+  mutate(play_in = ifelse(playoff_seed == 9 & abs(games_behind - dplyr::lead(games_behind)) <= 2, 1, 0), 
+    play_in = ifelse(playoff_seed == 8 & sum(play_in) == 1, 1, play_in), 
+    play_in = ifelse(is.na(play_in) == TRUE, 0, play_in)) %>% 
+  
+  # filter iter
+  filter(sim_season == x)
+
+# filtering 8-seeds/9-seeds
+eight_seeds <- play_in_sims %>% filter(play_in == 1 & playoff_seed == 8) %>% 
+  select(team, conf, sim_season) %>% 
+  mutate(playoff_seed = 8) %>% 
+  arrange(conf)
+nine_seeds <- play_in_sims %>% filter(play_in == 1 & playoff_seed == 9) %>% 
+  select(team, conf, sim_season) %>% 
+  mutate(playoff_seed = 9) %>% 
+  arrange(conf)
+
+# Series Game Number flag
+series_game <- rep(c(1:2), nrow(eight_seeds)) %>% sort()
+
+# Creating fake games 
+play_in_games <- rbind(eight_seeds, nine_seeds) %>% 
+  cbind(rbind(nine_seeds, eight_seeds)) %>% 
+  select(home_team = team, away_team = team1, conf, sim_season, playoff_seed) %>% 
+  ungroup() %>%
+  dplyr::mutate(game_num = series_game) %>%
+  
+  # Getting Home team model stats
+  left_join(team_data_for_sim %>% 
+              
+              # Rename vars for home
+              dplyr::rename(home_ows = ows, home_dws = dws, home_all_nba = AllNBA), 
+            by = c("home_team" = "team")) %>% 
+  
+  # Joining to get away team team stats
+  left_join(team_data_for_sim %>% 
+              
+              # Rename vars for away
+              dplyr::rename(away_ows = ows, away_dws = dws, away_all_nba = AllNBA), 
+            by = c("away_team" = "team")) %>% 
+  
+  
+  # Getting differentials for model preds.
+  mutate(ows_diff = home_ows - away_ows, 
+         dws_diff = home_dws - away_dws, 
+         all_nba_diff = home_all_nba - away_all_nba) %>% 
+
+  
+  # Getting vars needed
+  dplyr::select(home_team, away_team, conf, game_num, sim_season, playoff_seed, ows_diff, dws_diff, all_nba_diff) %>% 
+  ungroup()
+
+
+## Making Predictions on play in games
+play_in_model_data <- play_in_games %>% 
+  ungroup() %>%
+  dplyr::select(ows_diff:all_nba_diff) %>% 
+  # mutate_all(scale) %>%
+  data.matrix()
+
+play_in_preds <- predict(fit, s = cv_fit$lambda.min, newx = play_in_model_data) %>% as.data.frame() %>% 
+  dplyr::rename(pred_score_diff = `1`) %>% 
+  mutate(win_prob = predict(model_winprob, ., type = "response")) 
+
+# Sim data with preds 
+play_in_final <- play_in_games %>% cbind(play_in_preds)
+
+##### SIM PLAY IN GAMES #####
+
+# random sim
+sim_random <- runif(nrow(play_in_final))
+  
+# Join to play_in_final
+sim_df <- play_in_final %>% cbind(sim_random) %>% 
+  
+  # Simming result based on sim_random
+    mutate(sim_win = ifelse(win_prob >= sim_random, 1,0), 
+           sim_season = x) %>% 
+  dplyr::select(home_team:playoff_seed, sim_win) %>% 
+  
+  # Getting series winner
+  mutate(nine_seed_win_g1 = ifelse(sim_win == 0 & game_num == 1, 1, 0), 
+         nine_seed_win_g2 = ifelse(sim_win == 1 & game_num == 2, 1, 0)) %>%
+  group_by(conf, sim_season) %>% 
+  summarise(nine_seed_wins = sum(nine_seed_win_g1) + sum(nine_seed_win_g2)) %>% 
+  
+  # Flag for if nine seed won
+  mutate(nine_seed_wins = ifelse(nine_seed_wins == 2, 1, 0))
+
+print(x)
+return(sim_df)
+
+}
+
+# Run for each simmed season
+play_in_output <- lapply(play_in_seasons, play_the_play_in)
+play_in_output <- do.call(rbind, play_in_output)
+
+write_rds(play_in_output, "../SunsProject/play_in_simulated.rds")
+
+
+# Recalculating with play-in winners
+play_in_results <- sims %>% group_by(sim_season, conf) %>% 
+  arrange(desc(total_wins)) %>% 
+  mutate(playoff_seed = rank(-total_wins, ties.method = "random")) %>%
+  left_join(play_in_output, by = c("sim_season", "conf")) %>% 
+  mutate(made_playoffs = ifelse(playoff_seed <= 7, 1, 0), 
+         made_playoffs = ifelse(playoff_seed == 8 & nine_seed_wins == 0, 1, 
+                                ifelse(playoff_seed == 9 & nine_seed_wins == 1, 1, made_playoffs))) %>% 
+  
+  # Getting team playoff probs
+  group_by(team, conf) %>% 
+  summarise(playin_playoff_prob = round(mean(made_playoffs, na.rm = TRUE), 4))
+
+
+
+##################################
+########## FINAL STEP ############
+##################################
+
+# Join traditional and play in format probs to compare
+playoff_comparisons <- traditional_results %>% left_join(play_in_results, by = c("team", "conf")) %>% 
+  mutate(prob_diff = playin_playoff_prob - playoff_prob)
+
+
+# Plotting some stuff
+playoff_comparisons %>% ggplot(aes(x = playoff_prob, y = playin_playoff_prob)) + geom_point() + 
+  geom_abline() + theme_classic()
+
+#write to rds
+write_rds(playoff_comparisons, "../SunsProject/playoff_comparisons.rds")
+
+```
+
+
+### Playoff Probability Comparison {.tabset}
+
+In this final section, we can see how a play-in implementation effects the playoff odds for each team when compared to a traditional style season. My takeaways from this project are:
+
+- Teams projected to be in the playoffs (1-8 seeds) increase slightly in playoff probability when a play-in is in place. 
+
+- Teams projected to be out of the playoffs (9-15 seeds) decrease slightly in playoff probability when a play-in is in place.
+
+<br/>
+
+#### East Projections
+
+```{r, echo=TRUE}
+
+# Read in playoff comparisons rmd
+final_output <- read_rds("../SunsProject/playoff_comparisons.rds") %>% 
+  
+  # Rounding avg. wins column
+  mutate(avg_wins = round(avg_wins,1)) %>%
+  
+  # Rename columns for Rmd output
+  select(Team = team, Conference = conf, `Avg. Wins` = avg_wins, `Traditional Playoff Prob.` = playoff_prob, 
+         `Play-in Playoff Prob.` = playin_playoff_prob, Difference = prob_diff)
+
+
+# Output to Rmd
+library(DT)
+DT::datatable(final_output %>% filter(Conference == "East") %>% 
+                arrange(desc(`Avg. Wins`)), selection = "single",
+                  filter = 'top',
+                  options = list(sDom  = '<"top"><"bottom">', 
+                                  pageLength = 15)) %>% 
+      formatPercentage('Traditional Playoff Prob.', digits = 1) %>%
+      formatPercentage('Play-in Playoff Prob.', digits = 1) %>%
+      formatPercentage('Difference', digits = 2) %>%
+      formatStyle('Avg. Wins', background = styleColorBar(final_output$`Avg. Wins`, 'lightblue')) %>% 
+      formatStyle('Difference',
+                  color = styleInterval(c(-0.0007, 0.0007), c('red', 'gray', 'darkgreen'))
+  ) 
+
+
+```
+
+---
+
+#### West Projections
+
+```{r, echo=TRUE}
+
+# Read in playoff comparisons rmd
+final_output <- read_rds("../SunsProject/playoff_comparisons.rds") %>% 
+  
+  # Rounding avg. wins column
+  mutate(avg_wins = round(avg_wins,1)) %>%
+  
+  # Rename columns for Rmd output
+  select(Team = team, Conference = conf, `Avg. Wins` = avg_wins, `Traditional Playoff Prob.` = playoff_prob, 
+         `Play-in Playoff Prob.` = playin_playoff_prob, Difference = prob_diff)
+
+
+# Output to Rmd
+library(DT)
+DT::datatable(final_output %>% filter(Conference == "West") %>% 
+                arrange(desc(`Avg. Wins`)), selection = "single",
+                  filter = 'top',
+                  options = list(sDom  = '<"top"><"bottom">', 
+                                  pageLength = 15)) %>% 
+      formatPercentage('Traditional Playoff Prob.', digits = 1) %>%
+      formatPercentage('Play-in Playoff Prob.', digits = 1) %>%
+      formatPercentage('Difference', digits = 2) %>%
+      formatStyle('Avg. Wins', background = styleColorBar(final_output$`Avg. Wins`, 'lightblue')) %>% 
+      formatStyle('Difference',
+                  color = styleInterval(c(-0.0007, 0.0007), c('red', 'gray', 'darkgreen'))
+  ) 
+
+
+```
+
+---
